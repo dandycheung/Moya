@@ -1,4 +1,6 @@
 #!/bin/sh
+# Add Homebrew paths for both Intel (/usr/local) and Apple Silicon (/opt/homebrew).
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 case "$PLATFORM_NAME" in
     macosx) plat=Mac;;
@@ -14,7 +16,7 @@ for (( n = 0; n < SCRIPT_INPUT_FILE_COUNT; n++ )); do
     export SCRIPT_INPUT_FILE_$n="$SRCROOT"/Carthage/Build/$plat/"$framework"
 done
 
-/usr/local/bin/carthage copy-frameworks || exit
+carthage copy-frameworks || exit
 
 for (( n = 0; n < SCRIPT_INPUT_FILE_COUNT; n++ )); do
     VAR=SCRIPT_INPUT_FILE_$n

@@ -1,7 +1,7 @@
 import Nimble
 import Moya
 
-public func beOfSameErrorType(_ expectedValue: MoyaError) -> Predicate<MoyaError> {
+public func beOfSameErrorType(_ expectedValue: MoyaError) -> Nimble.Predicate<MoyaError> {
     Predicate { expression -> PredicateResult in
         let test: Bool
         if let value = try expression.evaluate() {
