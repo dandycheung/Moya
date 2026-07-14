@@ -49,28 +49,28 @@ end
 def devices
   return {
     ios: "OS=#{device_os[:ios]},name=#{device_names[:ios]}",
-    macos: "arch=x86_64",
+    macos: "arch=arm64",
     tvos: "OS=#{device_os[:tvos]},name=#{device_names[:tvos]}"
   }
 end
 
 def device_names
   return {
-    ios: "iPhone 8",
-    tvos: "Apple TV 4K (at 1080p) (2nd generation)"
+    ios: "iPhone SE (3rd generation)",
+    tvos: "Apple TV 4K (3rd generation)"
   }
 end
 
 def device_os
   return {
-    ios: "14.5",
-    tvos: "14.5"
+    ios: "26.2",
+    tvos: "26.2"
   }
 end
 
 def open_simulator_and_sleep(platform)
-  return if platform == :macos # Don't need a sleep on macOS because it runs first.
-  sh "xcrun instruments -w '#{device_names[platform]} (#{device_os[platform]})' || sleep 15"
+  return if platform == :macos
+  sh "xcrun simctl boot '#{device_names[platform]}' 2>/dev/null; sleep 15"
 end
 
 def xcodebuild(tasks, platform, xcprety_args: '', xcode_summary: false)
@@ -78,10 +78,18 @@ def xcodebuild(tasks, platform, xcprety_args: '', xcode_summary: false)
   scheme = schemes[platform]
   destination = devices[platform]
 
+  # Carthage deps were built with bumped deployment targets (to fix libarclite in Xcode 16)
+  # and without arm64 for simulators (to avoid lipo conflicts on Apple Silicon).
+  # Pass the same settings here so Moya compiles with matching targets.
+  extra_args = case sdk
+    when 'iphonesimulator' then "EXCLUDED_ARCHS='arm64' IPHONEOS_DEPLOYMENT_TARGET=12.0"
+    when 'appletvsimulator' then "EXCLUDED_ARCHS='arm64' TVOS_DEPLOYMENT_TARGET=12.0"
+    when 'macosx' then "MACOSX_DEPLOYMENT_TARGET=10.15"
+    else ''
+  end
+
   open_simulator_and_sleep(platform)
-  xcpretty_json_output_name = xcode_summary == true ? " XCPRETTY_JSON_FILE_OUTPUT=\"xcodebuild-#{platform}.json\"" : ""
-  xcpretty_formatter = xcode_summary == true ? " -f `bundle exec xcpretty-json-formatter`" : ""
-  safe_sh "set -o pipefail && xcodebuild -project '#{moya_project}' -scheme '#{scheme}' -configuration '#{configuration}' -sdk #{sdk} -destination '#{destination}' #{tasks} |#{xcpretty_json_output_name} bundle exec xcpretty -c #{xcprety_args}#{xcpretty_formatter}"
+  safe_sh "set -o pipefail && xcodebuild -project '#{moya_project}' -scheme '#{scheme}' -configuration '#{configuration}' -sdk #{sdk} -destination '#{destination}' #{extra_args} #{tasks} | bundle exec xcpretty -c #{xcprety_args}"
 end
 
 def xcodebuild_example(tasks, xcprety_args: '')
@@ -92,7 +100,7 @@ def xcodebuild_example(tasks, xcprety_args: '')
   demo_scheme = 'Basic'
 
   open_simulator_and_sleep(platform)
-  safe_sh "set -o pipefail && xcodebuild -project '#{demo_project}' -scheme '#{demo_scheme}' -configuration '#{configuration}' -sdk #{sdk} -destination '#{destination}' #{tasks} | bundle exec xcpretty -c #{xcprety_args}"
+  safe_sh "set -o pipefail && xcodebuild -project '#{demo_project}' -scheme '#{demo_scheme}' -configuration '#{configuration}' -sdk #{sdk} -destination '#{destination}' EXCLUDED_ARCHS='arm64' IPHONEOS_DEPLOYMENT_TARGET=13.0 #{tasks} | bundle exec xcpretty -c #{xcprety_args}"
 end
 
 desc 'Build Moya.'

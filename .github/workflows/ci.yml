@@ -1,0 +1,204 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      BUNDLE_PATH: vendor/bundle
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 16.4
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+
+      - name: Install SwiftLint
+        run: brew install swiftlint
+
+      - name: Cache Bundler
+        uses: actions/cache@v4
+        with:
+          path: vendor/bundle
+          key: ${{ runner.os }}-gems-${{ hashFiles('Gemfile.lock') }}
+
+      - name: Install Ruby Dependencies
+        run: bundle install
+
+      - name: Cache Carthage
+        id: cache-carthage
+        uses: actions/cache@v4
+        with:
+          path: Carthage
+          key: ${{ runner.os }}-carthage-v15-${{ hashFiles('Cartfile.resolved') }}
+
+      - name: Install Carthage
+        run: brew install carthage
+
+      - name: Carthage Checkout
+        if: steps.cache-carthage.outputs.cache-hit != 'true'
+        run: carthage checkout
+
+      - name: Fix Nimble DSL.m for Xcode 16
+        if: steps.cache-carthage.outputs.cache-hit != 'true'
+        run: |
+          find Carthage/Checkouts/Nimble -name "DSL.m" -exec \
+            sed -i '' 's/\*NMB_\([a-zA-Z_]*\)()/\*NMB_\1(void)/g' {} \;
+
+      - name: Patch Carthage checkouts for native macOS builds on Apple Silicon
+        if: steps.cache-carthage.outputs.cache-hit != 'true'
+        # On Apple Silicon + Xcode 16, iOS schemes have SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD
+        # enabled by default, which makes them claim macOS support. Carthage --platform Mac
+        # then picks the iOS scheme (not the native macOS one), producing arm64-apple-ios
+        # swiftmodules instead of arm64-apple-macos. XCODE_XCCONFIG_FILE is the lowest-
+        # priority override mechanism and cannot fix this.
+        #
+        # Two-part fix at the highest file-based priority (target build settings in pbxproj):
+        # 1. Remove IPHONEOS_DEPLOYMENT_TARGET so native macOS targets don't inherit it.
+        # 2. Use the xcodeproj gem (already installed via CocoaPods) to inject
+        #    SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO into each iOS target's build
+        #    settings (priority 6, above xcconfig at 5) so Carthage skips the iOS scheme
+        #    when building for --platform Mac and uses the native macOS scheme instead.
+        # scripts/carthage.sh re-adds IPHONEOS_DEPLOYMENT_TARGET for iphoneos/simulator
+        # SDKs via XCODE_XCCONFIG_FILE, so iOS builds are unaffected.
+        run: |
+          find Carthage/Checkouts -name "*.xcconfig" -o -name "project.pbxproj" | \
+            xargs grep -l "IPHONEOS_DEPLOYMENT_TARGET" 2>/dev/null | \
+            xargs sed -i '' '/IPHONEOS_DEPLOYMENT_TARGET/d'
+          bundle exec ruby -e '
+            require "xcodeproj"
+            Dir.glob("Carthage/Checkouts/**/*.xcodeproj").select { |p| File.directory?(p) }.each do |proj_path|
+              begin
+                project = Xcodeproj::Project.open(proj_path)
+                modified = false
+                project.targets.each do |target|
+                  target.build_configurations.each do |config|
+                    config.build_settings["SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD"] = "NO"
+                    modified = true
+                  end
+                end
+                if modified
+                  project.save
+                  puts "Patched: #{proj_path}"
+                end
+              rescue => e
+                puts "Skip #{proj_path}: #{e.message}"
+              end
+            end
+          '
+
+      - name: Bootstrap Carthage (iOS, tvOS, watchOS)
+        if: steps.cache-carthage.outputs.cache-hit != 'true'
+        run: scripts/carthage.sh build --cache-builds --platform iOS,tvOS,watchOS
+
+      - name: Remove iOS xcschemes before Mac build
+        if: steps.cache-carthage.outputs.cache-hit != 'true'
+        # iOS/tvOS/watchOS builds are complete; remove iOS xcscheme files so that
+        # `carthage build --platform Mac` only discovers native macOS schemes.
+        # Without this, Carthage still builds iOS schemes for Mac (via DISFIPAD),
+        # producing arm64-apple-ios swiftmodules that overwrite the native
+        # arm64-apple-macos ones — even after patching DISFIPAD=NO in pbxproj.
+        run: |
+          find Carthage/Checkouts -name "*iOS*.xcscheme" -delete
+          echo "Deleted iOS xcscheme files from Carthage/Checkouts"
+
+      - name: Bootstrap Carthage (Mac)
+        if: steps.cache-carthage.outputs.cache-hit != 'true'
+        # Build Mac separately. After "Clear IPHONEOS_DEPLOYMENT_TARGET" above removed
+        # the setting from all project files, macOS native schemes no longer inherit it
+        # and build with the correct arm64-apple-macos target triple.
+        # SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO is belt-and-suspenders: prevents
+        # any residual iOS-mode scheme from creating an arm64-apple-macos alias that
+        # would overwrite the native macOS swiftmodule.
+        run: |
+          xcconfig=$(mktemp /tmp/carthage-mac.xcconfig.XXXXXX)
+          echo 'MACOSX_DEPLOYMENT_TARGET = 10.15' > "$xcconfig"
+          echo 'GCC_WARN_STRICT_PROTOTYPES = NO' >> "$xcconfig"
+          echo 'OTHER_CFLAGS = $(inherited) -Wno-error=strict-prototypes' >> "$xcconfig"
+          echo 'IPHONEOS_DEPLOYMENT_TARGET[sdk=iphoneos*] = 12.0' >> "$xcconfig"
+          echo 'IPHONEOS_DEPLOYMENT_TARGET[sdk=iphonesimulator*] = 12.0' >> "$xcconfig"
+          echo 'SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO' >> "$xcconfig"
+          XCODE_XCCONFIG_FILE="$xcconfig" carthage build --cache-builds --platform Mac
+          rm -f "$xcconfig"
+
+      - name: Patch Mac swiftmodules for Apple Silicon
+        # Safety net: if a dependency's macOS build still produced an arm64-apple-ios
+        # binary swiftmodule (because SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD was
+        # ignored at target level), Swift rejects it with an SDK mismatch error.
+        # Detect these bad modules via `strings` and remove them so Swift falls back
+        # to arm64-apple-ios.swiftmodule (which is accepted for iPad-on-Mac lookup)
+        # or the framework binary directly.
+        # This step always runs so it also fixes frameworks restored from cache.
+        run: |
+          for fw in Carthage/Build/Mac/*.framework; do
+            name=$(basename "$fw" .framework)
+            moddir="$fw/Modules/$name.swiftmodule"
+            [ -d "$moddir" ] || continue
+            macos_mod="$moddir/arm64-apple-macos.swiftmodule"
+            [ -f "$macos_mod" ] || continue
+            # If arm64-apple-macos.swiftmodule contains "iphoneos" it was compiled
+            # with the iOS SDK — remove it to avoid the SDK mismatch linker error.
+            if strings "$macos_mod" 2>/dev/null | grep -q 'iphoneos'; then
+              echo "Removing iOS-SDK binary from $name/arm64-apple-macos.swiftmodule"
+              rm "$macos_mod"
+              rm -f "$moddir/arm64-apple-macos.swiftdoc"
+            fi
+          done
+
+      - name: Test on iOS
+        run: bundle exec rake test:ios
+
+      - name: Test on macOS
+        run: bundle exec rake test:macos
+
+      - name: Test on tvOS
+        run: bundle exec rake test:tvos
+
+      - name: Test with Carthage
+        run: bundle exec rake test:carthage
+
+      - name: Build Example Project
+        run: bundle exec rake build_example
+
+      - name: Update CocoaPods gem
+        # Alamofire now requires CocoaPods >= 1.13.0; the lockfile pins 1.11.3.
+        # Update only cocoapods so the spec lint picks up a compatible version.
+        run: bundle update cocoapods
+
+      - name: CocoaPods Spec Lint
+        # Exclude macOS: ReactiveSwift's podspec sets osx.deployment_target='10.9',
+        # and Xcode 16.4's SDK now requires 10.10+ for Date/Notification/URLRequest.
+        # macOS is already validated by the "Test on macOS" step above.
+        run: bundle exec pod lib lint --allow-warnings --platforms=ios,tvos,watchos
+
+      - name: Upload Coverage to Codecov
+        run: bash <(curl -s https://codecov.io/bash) -J Moya
+
+  carthage_without_swiftlint:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 16.4
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+
+      - name: Install Carthage
+        run: brew install carthage
+
+      - name: Carthage Checkout
+        run: carthage checkout
+
+      - name: Fix Nimble DSL.m for Xcode 16
+        run: |
+          find Carthage/Checkouts/Nimble -name "DSL.m" -exec \
+            sed -i '' 's/\*NMB_\([a-zA-Z_]*\)()/\*NMB_\1(void)/g' {} \;
+
+      - name: Test Carthage Build (without SwiftLint)
+        # Limit to iOS to avoid ReactiveSwift-macOS producing arm64-apple-ios modules
+        # on Apple Silicon when building all platforms with --no-skip-current.
+        run: scripts/carthage.sh build --no-skip-current --no-use-binaries --platform iOS
